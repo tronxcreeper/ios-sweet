@@ -1,0 +1,177 @@
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -16,6 +16,7 @@
+ iokit/Kernel/arm/SweetSurface.cpp                                optional iokitcpp
+ iokit/Kernel/arm/SweetFramebuffer.cpp                            optional iokitcpp
+ iokit/Kernel/arm/SweetBattery.cpp                                optional iokitcpp
++iokit/Kernel/arm/SweetSMMU.cpp                                 optional iokitcpp
+ iokit/Kernel/arm/hid/SweetHID.cpp                                optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEvent.cpp                              optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEventServiceQueue.cpp                  optional iokitcpp
+diff --git a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -82,6 +82,12 @@
+     "     'IOProviderClass' = IOResources;"
+     "     'IOMatchCategory' = SweetBattery;"
+     "   },"
++    "   {"
++    "     'IOClass'         = SweetSMMU;"
++    "     'IOProviderClass' = IOPlatformDevice;"
++    "     'IONameMatch'     = 'qcom,smmu-v2';"
++    "     'IOProbeScore'    = 1000:32;"
++    "   },"
+ #endif
+     "   {"
+     "     'IOClass'         = IOPanicPlatform;"
+diff --git a/iokit/Kernel/arm/SweetPlatformExpert.cpp b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+--- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
++++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+@@ -9,6 +9,8 @@
+ #include <IOKit/IOPlatformExpert.h>
+ #include <IOKit/IODeviceTreeSupport.h>
+ #include <IOKit/IOLib.h>
++#include <libkern/c++/OSData.h>
++#include <string.h>
+ 
+ class SweetPlatformExpert : public IODTPlatformExpert {
+ 	OSDeclareDefaultStructors(SweetPlatformExpert);
+@@ -72,6 +74,55 @@
+ 		createNubs(this, IODTFindMatchingEntries(armio, kIODTExclusive, "('gic')"));
+ 		armio->release();
+ 	}
++
++	/*
++	 * Publish only the KGSL hardware SMMU.
++	 */
++	IORegistryEntry *soc = root->childFromPath("soc", gIODTPlane);
++	if (soc != NULL) {
++		IORegistryEntry *smmu =
++			soc->childFromPath("arm,smmu-kgsl@5040000", gIODTPlane);
++		if (smmu != NULL) {
++			IOService *nub = NULL;
++			OSData *compatible = OSDynamicCast(
++				OSData, smmu->getProperty(gIODTCompatibleKey));
++
++			if (compatible != NULL) {
++				const char target[] = "qcom,smmu-v2";
++				const char *bytes =
++					(const char *)compatible->getBytesNoCopy();
++				unsigned int length = compatible->getLength();
++				unsigned int offset = 0;
++
++				while (bytes != NULL && offset < length) {
++					unsigned int remaining = length - offset;
++					unsigned int itemLength = 0;
++					while (itemLength < remaining &&
++					       bytes[offset + itemLength] != '\0') {
++						itemLength++;
++					}
++					if (itemLength == sizeof(target) - 1 &&
++					    memcmp(bytes + offset, target,
++					           sizeof(target) - 1) == 0) {
++						nub = createNub(smmu);
++						break;
++					}
++					if (itemLength == remaining) {
++						break;
++					}
++					offset += itemLength + 1;
++				}
++			}
++
++			if (nub != NULL) {
++				nub->attach(this);
++				nub->registerService();
++				nub->release();
++			}
++			smmu->release();
++		}
++		soc->release();
++	}
+ }
+ 
+ /*
+diff --git a/iokit/Kernel/arm/SweetSMMU.cpp b/iokit/Kernel/arm/SweetSMMU.cpp
+new file mode 100644
+--- /dev/null
++++ b/iokit/Kernel/arm/SweetSMMU.cpp
+@@ -0,0 +1,77 @@
++/*
++ * SweetSMMU.cpp
++ *
++ * Read-only diagnostic driver for Qualcomm SM7150 SMMU v2.
++ * This version inspects Device Tree resources only; it does not map or
++ * access SMMU registers.
++ */
++
++#include <IOKit/IOService.h>
++#include <IOKit/IODeviceMemory.h>
++
++#define SWEET_SMMU_BASE       0x05040000ULL
++#define SWEET_SMMU_SIZE       0x00010000ULL
++
++class SweetSMMU : public IOService
++{
++    OSDeclareDefaultStructors(SweetSMMU);
++
++public:
++    bool start(IOService *provider) override;
++    void stop(IOService *provider) override;
++};
++
++OSDefineMetaClassAndStructors(SweetSMMU, IOService);
++
++bool
++SweetSMMU::start(IOService *provider)
++{
++    if (!IOService::start(provider)) {
++        return false;
++    }
++
++    /*
++     * Resolve the provider's Device Tree resources.
++     * This does not map or access the SMMU MMIO registers.
++     */
++    if (provider->getResources() != kIOReturnSuccess) {
++        IOLog("SweetSMMU: failed to obtain device resources\n");
++        return false;
++    }
++
++    if (provider->getDeviceMemoryCount() < 1) {
++        IOLog("SweetSMMU: no MMIO resource\n");
++        return false;
++    }
++
++    /*
++     * Borrowed pointer: retained by the provider.
++     * Do not release it.
++     */
++    IODeviceMemory *memory = provider->getDeviceMemoryWithIndex(0);
++    if (memory == nullptr) {
++        IOLog("SweetSMMU: cannot obtain MMIO resource\n");
++        return false;
++    }
++
++    const IOPhysicalAddress address = memory->getPhysicalAddress();
++    const IOByteCount length = memory->getLength();
++
++    IOLog("SweetSMMU: DT resource base=%llx length=%llx\n",
++        (unsigned long long)address,
++        (unsigned long long)length);
++
++    if (address != SWEET_SMMU_BASE || length < SWEET_SMMU_SIZE) {
++        IOLog("SweetSMMU: unexpected MMIO resource; no register access\n");
++        return false;
++    }
++
++    IOLog("SweetSMMU: expected resource found; register access skipped\n");
++    return true;
++}
++
++void
++SweetSMMU::stop(IOService *provider)
++{
++    IOService::stop(provider);
++}
